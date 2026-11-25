@@ -1,0 +1,18 @@
+# Local Claude Code notes
+CLAUDE.md
+.claude/
+
+# clasp credentials
+.clasprc.json
+
+# Guard against committing roster or scan exports
+*.csv
+*.xlsx
+*.ods
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.vscode/
+
+node_modules/

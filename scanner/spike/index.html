@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Scanner Spike</title>
+  <style>
+    :root {
+      --bg: #ffffff;
+      --fg: #1a1a1a;
+      --muted: #666666;
+      --border: #d0d0d0;
+      --panel: #f5f5f5;
+      --green: #1f9d55;
+      --red: #d93025;
+      --grey: #808080;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #121212;
+        --fg: #eeeeee;
+        --muted: #a0a0a0;
+        --border: #3a3a3a;
+        --panel: #1e1e1e;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 16px;
+      background: var(--bg);
+      color: var(--fg);
+      font: 16px/1.4 system-ui, -apple-system, sans-serif;
+    }
+    h1 { font-size: 1.3rem; margin: 0 0 12px; }
+    h2 { font-size: 1.1rem; margin: 0 0 8px; }
+    section {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+      margin-bottom: 16px;
+    }
+    .row { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+    button, input, select {
+      font: inherit;
+      padding: 10px 14px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--fg);
+    }
+    input { flex: 1; min-width: 0; }
+    pre {
+      background: var(--panel);
+      padding: 8px;
+      border-radius: 6px;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: 0.85rem;
+      margin: 0;
+    }
+    video {
+      width: 100%;
+      max-height: 50vh;
+      background: #000;
+      border-radius: 6px;
+      object-fit: contain;
+    }
+    .stats { color: var(--muted); font-size: 0.9rem; }
+    #last-read { font-size: 1.4rem; font-weight: 600; min-height: 1.4em; }
+    #flash {
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 0.4s ease-out;
+    }
+    #flash.show { opacity: 0.6; transition: none; }
+    #flash.green { background: var(--green); }
+    #flash.red { background: var(--red); }
+    #flash.grey { background: var(--grey); }
+  </style>
+</head>
+<body>
+  <h1>Scanner spike</h1>
+
+  <section>
+    <h2>1. API</h2>
+    <div class="row">
+      <input id="pin" type="password" inputmode="numeric" placeholder="PIN" autocomplete="off">
+    </div>
+    <div class="row">
+      <button id="get-roster">Get roster</button>
+      <button id="send-scans">Send 3 fake scans</button>
+    </div>
+    <pre id="api-output">No request yet.</pre>
+  </section>
+
+  <section>
+    <h2>2. Camera and decoder</h2>
+    <div class="row">
+      <select id="resolution">
+        <option value="640x480">640 × 480</option>
+        <option value="1280x720" selected>1280 × 720</option>
+        <option value="1920x1080">1920 × 1080</option>
+      </select>
+      <button id="start-camera">Start</button>
+      <button id="stop-camera">Stop</button>
+    </div>
+    <video id="video" playsinline muted></video>
+    <div id="last-read"></div>
+    <pre id="camera-stats" class="stats">Decoder loading…</pre>
+  </section>
+
+  <section>
+    <h2>Device</h2>
+    <pre id="device-info"></pre>
+  </section>
+
+  <div id="flash"></div>
+
+  <script type="module">
+    import { API_URL } from "../config.js";
+    import {
+      prepareZXingModule,
+      readBarcodes,
+    } from "https://cdn.jsdelivr.net/npm/zxing-wasm@3.1.6/dist/es/reader/index.js";
+
+    const READER_OPTIONS = { formats: ["QRCode"], maxNumberOfSymbols: 1 };
+    const REPEAT_COOLDOWN_MS = 3000;
+
+    const $ = (id) => document.getElementById(id);
+    const deviceId = `spike-${crypto.randomUUID().slice(0, 8)}`;
+
+    let scanCounter = 0;
+    let roster = null;
+
+    $("device-info").textContent = [
+      `device_id: ${deviceId}`,
+      `secure context: ${window.isSecureContext}`,
+      `camera API: ${Boolean(navigator.mediaDevices?.getUserMedia)}`,
+      `user agent: ${navigator.userAgent}`,
+    ].join("\n");
+
+    // ---- API test ----
+
+    async function postJson(body) {
+      const started = performance.now();
+      const response = await fetch(API_URL, {
+        method: "POST",
+        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        body: JSON.stringify(body),
+        redirect: "follow",
+      });
+      const data = await response.json();
+      return { status: response.status, ms: Math.round(performance.now() - started), data };
+    }
+
+    async function runApiTest(buildBody, describe) {
+      const output = $("api-output");
+      if (!API_URL) {
+        output.textContent = "API_URL is empty. Set it in scanner/config.js.";
+        return;
+      }
+      output.textContent = "Sending…";
+      try {
+        const { status, ms, data } = await postJson(buildBody());
+        output.textContent = `HTTP ${status} in ${ms} ms\n${describe(data)}\n\n${JSON.stringify(data, null, 2)}`;
+      } catch (err) {
+        output.textContent = `Request failed: ${err.name}: ${err.message}`;
+      }
+    }
+
+    function fakeScan() {
+      scanCounter += 1;
+      return {
+        scan_id: `${deviceId}-${scanCounter}`,
+        code: "SPIKETEST1",
+        room: "Room A",
+        session: "S1",
+        scanned_at: new Date().toISOString(),
+        result: "green",
+      };
+    }
+
+    $("get-roster").addEventListener("click", () =>
+      runApiTest(
+        () => ({ action: "roster", pin: $("pin").value }),
+        (data) => {
+          if (!data.ok) return `Rejected: ${data.error}`;
+          roster = new Map(data.roster.map((person) => [person.code, person]));
+          return `Roster loaded: ${roster.size} people`;
+        }
+      )
+    );
+
+    $("send-scans").addEventListener("click", () => {
+      let sentIds = [];
+      runApiTest(
+        () => {
+          const scans = [fakeScan(), fakeScan(), fakeScan()];
+          sentIds = scans.map((scan) => scan.scan_id);
+          return {
+            action: "scans",
+            pin: $("pin").value,
+            device_id: deviceId,
+            batch_id: `${deviceId}-b${Date.now()}`,
+            scans,
+          };
+        },
+        (data) => {
+          if (!data.ok) return `Rejected: ${data.error}`;
+          const acked = sentIds.filter((id) => data.received.includes(id)).length;
+          return `Acknowledged ${acked}/${sentIds.length} scans`;
+        }
+      );
+    });
+
+    // ---- Camera and decoder test ----
+
+    const video = $("video");
+    const canvas = document.createElement("canvas");
+    const context = canvas.getContext("2d", { willReadFrequently: true });
+
+    let stream = null;
+    let audio = null;
+    let decodeTimes = [];
+    let lastText = null;
+    let lastTextAt = 0;
+    let readCount = 0;
+
+    const decoderLoadStart = performance.now();
+    prepareZXingModule({ fireImmediately: true })
+      .then(() => {
+        $("camera-stats").textContent =
+          `Decoder ready in ${Math.round(performance.now() - decoderLoadStart)} ms`;
+      })
+      .catch((err) => {
+        $("camera-stats").textContent = `Decoder failed to load: ${err.message}`;
+      });
+
+    function unlockAudio() {
+      if (audio) return;
+      if (navigator.audioSession) navigator.audioSession.type = "playback";
+      audio = new (window.AudioContext || window.webkitAudioContext)();
+      audio.resume();
+    }
+
+    function beep(frequency) {
+      if (!audio) return;
+      const oscillator = audio.createOscillator();
+      const gain = audio.createGain();
+      oscillator.frequency.value = frequency;
+      gain.gain.setValueAtTime(0.3, audio.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, audio.currentTime + 0.15);
+      oscillator.connect(gain).connect(audio.destination);
+      oscillator.start();
+      oscillator.stop(audio.currentTime + 0.15);
+    }
+
+    function flash(colour) {
+      const element = $("flash");
+      element.className = `${colour} show`;
+      requestAnimationFrame(() => requestAnimationFrame(() => element.classList.remove("show")));
+    }
+
+    function handleRead(text) {
+      const now = performance.now();
+      if (text === lastText && now - lastTextAt < REPEAT_COOLDOWN_MS) return;
+      lastText = text;
+      lastTextAt = now;
+      readCount += 1;
+
+      const person = roster?.get(text);
+      if (!roster) {
+        flash("green");
+        beep(880);
+        $("last-read").textContent = text;
+      } else if (person) {
+        flash("green");
+        beep(880);
+        $("last-read").textContent = `${person.first_name}, ${person.team_id}, ${person.room}`;
+      } else {
+        flash("grey");
+        beep(330);
+        $("last-read").textContent = `Unknown: ${text}`;
+      }
+    }
+
+    function renderStats() {
+      const recent = decodeTimes.slice(-30);
+      const average = recent.reduce((sum, ms) => sum + ms, 0) / (recent.length || 1);
+      $("camera-stats").textContent = [
+        `video: ${video.videoWidth} × ${video.videoHeight}`,
+        `last decode: ${Math.round(decodeTimes.at(-1) ?? 0)} ms`,
+        `avg decode (last 30): ${Math.round(average)} ms`,
+        `frames decoded: ${decodeTimes.length}`,
+        `codes read: ${readCount}`,
+      ].join("\n");
+    }
+
+    async function scanLoop() {
+      while (stream) {
+        if (video.readyState >= video.HAVE_CURRENT_DATA && video.videoWidth) {
+          if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+          }
+          context.drawImage(video, 0, 0, canvas.width, canvas.height);
+          const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+          const started = performance.now();
+          const results = await readBarcodes(imageData, READER_OPTIONS);
+          decodeTimes.push(performance.now() - started);
+          if (results.length > 0) handleRead(results[0].text);
+          renderStats();
+        }
+        await new Promise((resolve) => requestAnimationFrame(resolve));
+      }
+    }
+
+    async function startCamera() {
+      unlockAudio();
+      stopCamera();
+      const [width, height] = $("resolution").value.split("x").map(Number);
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: {
+            facingMode: { ideal: "environment" },
+            width: { ideal: width },
+            height: { ideal: height },
+          },
+        });
+      } catch (err) {
+        $("camera-stats").textContent = `Camera failed: ${err.name}: ${err.message}`;
+        return;
+      }
+      video.srcObject = stream;
+      await video.play();
+      decodeTimes = [];
+      readCount = 0;
+      scanLoop();
+    }
+
+    function stopCamera() {
+      if (!stream) return;
+      stream.getTracks().forEach((track) => track.stop());
+      stream = null;
+      video.srcObject = null;
+    }
+
+    $("start-camera").addEventListener("click", startCamera);
+    $("stop-camera").addEventListener("click", stopCamera);
+  </script>
+</body>
+</html>
